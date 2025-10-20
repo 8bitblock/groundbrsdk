@@ -1,228 +1,190 @@
-#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
-
 #include <iostream>
+#include <vector>
 #include <Windows.h>
 #include <TlHelp32.h>
-#include <tchar.h>
-#include <vector>
 #include <string>
-#include <algorithm>
-#include <locale>
-#include <codecvt>
-#include <psapi.h>
+#include <map>
+#include <conio.h>
+#include <chrono>
 
-#include "SDK.h"
-#include "overlay.h"
-#include "structs.h"
+// --- DATA STRUCTURES AND OFFSETS ---
 
-// Globals
-HANDLE g_process_handle = NULL;
-uintptr_t g_module_base = 0;
-uintptr_t g_gnames_addr = 0;
+struct CheatState {
+    std::string name;
+    bool enabled = false;
+    int key;
+    uintptr_t address = 0;
+    std::vector<BYTE> original_value;
+};
 
-// Offsets
-const uintptr_t OFFSET_GNAMES = 0x6B898C0; // 112580800
-const uintptr_t OFFSET_GWORLD = 0x69244A8;
-const uintptr_t OFFSET_PERSISTENT_LEVEL = 0x30;
-const uintptr_t OFFSET_ACTOR_CLUSTER = 0xD8;
-const uintptr_t OFFSET_ACTORS = 0x28;
-const uintptr_t OFFSET_NAME_PRIVATE = 0x18;
-const uintptr_t OFFSET_CLASS_PRIVATE = 0x10;
-const uintptr_t OFFSET_PLAYER_CONTROLLER = 0x30;
-const uintptr_t OFFSET_PLAYER_CAMERA_MANAGER = 0x2B8;
-const uintptr_t OFFSET_CAMERA_CACHE = 0x290;
-const uintptr_t OFFSET_ROOT_COMPONENT = 0x130;
-const uintptr_t OFFSET_RELATIVE_LOCATION = 0x11C;
-const uintptr_t OFFSET_LOCALPLAYER = 0x6CC8390;
+namespace Offsets {
+    const std::vector<uintptr_t> PlayerController_BaseChain = { 0x30, 0x5D0 };
+    const uintptr_t APawn_Offset = 0x2A0;
 
+    const std::map<std::string, std::vector<uintptr_t>> controller_chains = {
+        {"health", {0x594}},
+        {"stamina", {0x744}},
+        {"max_stamina", {0x740}},
+        {"rapid_fire", {0x618, 0x508, 0x4}}
+    };
 
-// Memory reading functions
-template<typename T>
-T read_memory(uintptr_t address) {
-    T buffer;
-    if (g_process_handle && address != 0 && ReadProcessMemory(g_process_handle, (LPCVOID)address, &buffer, sizeof(T), NULL)) {
-        return buffer;
-    }
-    return T{};
+    // NOTE: This chain is known to be incorrect from our debug logs.
+    const std::map<std::string, std::vector<uintptr_t>> pawn_chains = {
+        {"ammo_count", {0x618, 0x598, 0x208, 0x460}},
+        {"ammo_capacity", {0x618, 0x598, 0x208, 0x458}}
+    };
 }
 
-// FName to string conversion
-std::string get_fname_string(uintptr_t fname_ptr) {
-    if (fname_ptr == 0) return "None";
+// --- UTILITY FUNCTIONS ---
 
-    int name_index = read_memory<int>(fname_ptr);
-
-    uintptr_t name_entry_ptr_addr = g_gnames_addr + (name_index / 0x4000) * 8;
-    uintptr_t name_entry_ptr = read_memory<uintptr_t>(name_entry_ptr_addr);
-    uintptr_t name_entry_addr = name_entry_ptr + (name_index % 0x4000) * 0x10;
-
-    char buffer[1024];
-    ReadProcessMemory(g_process_handle, (LPCVOID)(name_entry_addr + 0x10), buffer, sizeof(buffer), NULL);
-    return std::string(buffer);
-}
-
-FVector2D WorldToScreen(FVector world_location, FCameraCacheEntry camera_cache, int screen_width, int screen_height)
-{
-    FMatrix camera_matrix = camera_cache.POV.Rotation.ToMatrix();
-    FVector camera_location = camera_cache.POV.Location;
-
-    FVector v_axis_x, v_axis_y, v_axis_z;
-
-    v_axis_x = FVector(camera_matrix.M[0][0], camera_matrix.M[0][1], camera_matrix.M[0][2]);
-    v_axis_y = FVector(camera_matrix.M[1][0], camera_matrix.M[1][1], camera_matrix.M[1][2]);
-    v_axis_z = FVector(camera_matrix.M[2][0], camera_matrix.M[2][1], camera_matrix.M[2][2]);
-
-    FVector v_delta = world_location - camera_location;
-    FVector v_transformed = FVector(v_delta.Dot(v_axis_y), v_delta.Dot(v_axis_z), v_delta.Dot(v_axis_x));
-
-    if (v_transformed.Z < 1.f)
-        v_transformed.Z = 1.f;
-
-    float fov_angle = camera_cache.POV.FOV;
-    float screen_center_x = screen_width / 2.f;
-    float screen_center_y = screen_height / 2.f;
-
-    FVector2D screen_location;
-    screen_location.X = screen_center_x + v_transformed.X * (screen_center_x / tanf(fov_angle * (float)M_PI / 360.f)) / v_transformed.Z;
-    screen_location.Y = screen_center_y - v_transformed.Y * (screen_center_y / tanf(fov_angle * (float)M_PI / 360.f)) / v_transformed.Z;
-
-    return screen_location;
-}
-
-// Process functions
-DWORD get_process_id(const TCHAR* process_name) {
-    DWORD process_id = 0;
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32 process_entry;
-        process_entry.dwSize = sizeof(process_entry);
-        if (Process32First(snapshot, &process_entry)) {
-            do {
-                if (_tcsicmp(process_entry.szExeFile, process_name) == 0) {
-                    process_id = process_entry.th32ProcessID;
-                    break;
-                }
-            } while (Process32Next(snapshot, &process_entry));
+DWORD GetProcId(const wchar_t* procName) {
+    DWORD procId = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 procEntry;
+        procEntry.dwSize = sizeof(procEntry);
+        if (Process32First(hSnap, &procEntry)) {
+            do { if (!_wcsicmp(procEntry.szExeFile, procName)) { procId = procEntry.th32ProcessID; break; } } while (Process32Next(hSnap, &procEntry));
         }
-        CloseHandle(snapshot);
     }
-    return process_id;
+    CloseHandle(hSnap);
+    return procId;
 }
 
-uintptr_t get_module_base_address(DWORD process_id, const TCHAR* module_name) {
-    uintptr_t module_base_address = 0;
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, process_id);
-    if (snapshot != INVALID_HANDLE_VALUE) {
-        MODULEENTRY32 module_entry;
-        module_entry.dwSize = sizeof(module_entry);
-        if (Module32First(snapshot, &module_entry)) {
-            do {
-                if (_tcsicmp(module_entry.szModule, module_name) == 0) {
-                    module_base_address = (uintptr_t)module_entry.modBaseAddr;
-                    break;
-                }
-            } while (Module32Next(snapshot, &module_entry));
+uintptr_t GetModuleBaseAddress(DWORD procId, const wchar_t* modName) {
+    uintptr_t modBaseAddr = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, procId);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        MODULEENTRY32 modEntry;
+        modEntry.dwSize = sizeof(modEntry);
+        if (Module32First(hSnap, &modEntry)) {
+            do { if (!_wcsicmp(modEntry.szModule, modName)) { modBaseAddr = (uintptr_t)modEntry.modBaseAddr; break; } } while (Module32Next(hSnap, &modEntry));
         }
-        CloseHandle(snapshot);
     }
-    return module_base_address;
+    CloseHandle(hSnap);
+    return modBaseAddr;
 }
+
+uintptr_t ResolvePointerChain(HANDLE hProc, uintptr_t baseAddress, const std::vector<uintptr_t>& offsets) {
+    uintptr_t addr = baseAddress;
+    for (size_t i = 0; i < offsets.size() - 1; ++i) {
+        uintptr_t readAddress = addr + offsets[i];
+        if (!ReadProcessMemory(hProc, (LPCVOID)readAddress, &addr, sizeof(uintptr_t), nullptr) || addr == 0) return 0;
+    }
+    return addr + offsets.back();
+}
+
+// --- CHEAT MANAGEMENT FUNCTIONS ---
+
+void StoreOriginalValue(HANDLE hProc, CheatState& cheat, size_t value_size) {
+    if (cheat.address != 0 && cheat.original_value.empty()) {
+        cheat.original_value.resize(value_size);
+        ReadProcessMemory(hProc, (LPCVOID)cheat.address, cheat.original_value.data(), value_size, nullptr);
+    }
+}
+
+void RestoreOriginalValue(HANDLE hProc, const CheatState& cheat) {
+    if (cheat.address != 0 && !cheat.original_value.empty()) {
+        WriteProcessMemory(hProc, (LPVOID)cheat.address, cheat.original_value.data(), cheat.original_value.size(), nullptr);
+    }
+}
+
+void ApplyCheatValue(HANDLE hProc, uintptr_t address, const void* cheat_value, size_t value_size) {
+    if (address != 0) WriteProcessMemory(hProc, (LPVOID)address, cheat_value, value_size, nullptr);
+}
+
+void PrintMenu(const std::map<std::string, CheatState>& cheats) {
+    system("cls");
+    std::cout << "--- Ground Branch Definitive Cheat (Restored) ---" << std::endl;
+    for (const auto& pair : cheats) {
+        const auto& cheat = pair.second;
+        std::cout << "[" << cheat.key << "] " << cheat.name << ": " << (cheat.enabled ? "ON" : "OFF") << std::endl;
+    }
+    std::cout << "\n[Q] to Quit (restores all values)" << std::endl;
+}
+
+// --- MAIN LOGIC ---
 
 int main() {
-    const TCHAR* process_name = _T("GroundBranch-Win64-Shipping.exe");
-    DWORD process_id = 0;
+    const wchar_t* processName = L"GroundBranch-Win64-Shipping.exe";
+    const uintptr_t staticPointerOffset = 0x6CC8390;
 
-    _tprintf(_T("Searching for process: %s...\n"), process_name);
-    while (process_id == 0) {
-        process_id = get_process_id(process_name);
+    std::map<std::string, CheatState> cheats = {
+        {"health", {"Infinite Health", false, 1}},
+        {"stamina", {"Infinite Stamina", false, 2}},
+        {"ammo", {"Infinite Ammo (BROKEN)", false, 3}},
+        {"rapid_fire", {"Rapid Fire", false, 4}}
+    };
+
+    DWORD procId = GetProcId(processName);
+    if (procId == 0) { std::wcerr << L"Process not found." << std::endl; system("pause"); return 1; }
+    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, procId);
+    if (hProcess == NULL) { std::cerr << "Failed to open process." << std::endl; system("pause"); return 1; }
+    uintptr_t moduleBase = GetModuleBaseAddress(procId, processName);
+
+    uintptr_t initial_ptr = 0;
+    uintptr_t playerControllerBase = 0;
+    uintptr_t pawnBase = 0;
+
+    std::cout << "Waiting for game..." << std::endl;
+    while (playerControllerBase == 0 || pawnBase == 0) {
+        ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + staticPointerOffset), &initial_ptr, sizeof(initial_ptr), nullptr);
+        if (initial_ptr) {
+            uintptr_t controllerPtrAddr = ResolvePointerChain(hProcess, initial_ptr, Offsets::PlayerController_BaseChain);
+            if (controllerPtrAddr) ReadProcessMemory(hProcess, (LPCVOID)controllerPtrAddr, &playerControllerBase, sizeof(playerControllerBase), nullptr);
+
+            uintptr_t pawnPtrAddr = initial_ptr + Offsets::APawn_Offset;
+            ReadProcessMemory(hProcess, (LPCVOID)pawnPtrAddr, &pawnBase, sizeof(pawnBase), nullptr);
+        }
         Sleep(1000);
     }
-    _tprintf(_T("Process found! PID: %d\n"), process_id);
 
-    g_process_handle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, process_id);
-    if (g_process_handle == NULL) {
-        _ftprintf(stderr, _T("Failed to open process. Error: %d\n"), GetLastError());
-        return 1;
-    }
+    cheats["health"].address = ResolvePointerChain(hProcess, playerControllerBase, Offsets::controller_chains.at("health"));
+    cheats["stamina"].address = ResolvePointerChain(hProcess, playerControllerBase, Offsets::controller_chains.at("stamina"));
+    uintptr_t max_stamina_addr = ResolvePointerChain(hProcess, playerControllerBase, Offsets::controller_chains.at("max_stamina"));
+    cheats["rapid_fire"].address = ResolvePointerChain(hProcess, playerControllerBase, Offsets::controller_chains.at("rapid_fire"));
+    cheats["ammo"].address = ResolvePointerChain(hProcess, playerControllerBase, Offsets::pawn_chains.at("ammo_count"));
+    uintptr_t ammo_cap_addr = ResolvePointerChain(hProcess, playerControllerBase, Offsets::pawn_chains.at("ammo_capacity"));
 
-    g_module_base = get_module_base_address(process_id, process_name);
-    if (g_module_base == 0) {
-        _ftprintf(stderr, _T("[FATAL] Failed to get module base address. The program cannot continue.\n"));
-        system("pause");
-        CloseHandle(g_process_handle);
-        return 1;
-    }
+    std::cout << "Ready! Launching cheat UI..." << std::endl;
+    Sleep(500);
+    PrintMenu(cheats);
 
-    g_gnames_addr = read_memory<uintptr_t>(g_module_base + OFFSET_GNAMES);
-
-    CreateOverlay(_T("ESP Overlay"), _T("GroundBranch-Win64-Shipping"));
-
-    // --- Main Cheat Loop ---
-    std::cout << "Starting main cheat loop. Reading game data..." << std::endl;
-    HWND last_foreground_window = NULL;
+    auto last_ammo_check = std::chrono::steady_clock::now();
     while (true) {
-        if (GetForegroundWindow() != last_foreground_window)
-        {
-            UpdateOverlayPosition();
-            last_foreground_window = GetForegroundWindow();
-        }
-        StartRender();
-
-        uintptr_t gworld_ptr_addr = g_module_base + OFFSET_GWORLD;
-        uintptr_t gworld_addr = read_memory<uintptr_t>(gworld_ptr_addr);
-        if (gworld_addr == 0) {
-            std::cout << "Could not find GWorld. Retrying..." << std::endl;
-            Sleep(1000);
-            continue;
-        }
-
-        uintptr_t persistent_level_addr = read_memory<uintptr_t>(gworld_addr + OFFSET_PERSISTENT_LEVEL);
-        if (persistent_level_addr == 0) {
-            std::cout << "Could not find PersistentLevel. Retrying..." << std::endl;
-            Sleep(1000);
-            continue;
-        }
-
-        uintptr_t actor_cluster_addr = read_memory<uintptr_t>(persistent_level_addr + OFFSET_ACTOR_CLUSTER);
-        if (actor_cluster_addr == 0) {
-            std::cout << "Could not find ActorCluster. Retrying..." << std::endl;
-            Sleep(1000);
-            continue;
-        }
-
-        TArray<uintptr_t> actors = read_memory<TArray<uintptr_t>>(actor_cluster_addr + OFFSET_ACTORS);
-        if (actors.Data == nullptr || actors.Count == 0) {
-            std::cout << "Could not find actors. Retrying..." << std::endl;
-            Sleep(1000);
-            continue;
-        }
-
-        uintptr_t local_player_controller_addr = read_memory<uintptr_t>(read_memory<uintptr_t>(g_module_base + OFFSET_LOCALPLAYER) + OFFSET_PLAYER_CONTROLLER);
-        uintptr_t player_camera_manager_addr = read_memory<uintptr_t>(local_player_controller_addr + OFFSET_PLAYER_CAMERA_MANAGER);
-        FCameraCacheEntry camera_cache = read_memory<FCameraCacheEntry>(player_camera_manager_addr + OFFSET_CAMERA_CACHE);
-
-        uintptr_t* actor_data = actors.Data;
-        for (int i = 0; i < actors.Count; ++i) {
-            uintptr_t actor_addr = read_memory<uintptr_t>((uintptr_t)actor_data + i * sizeof(uintptr_t));
-            if (actor_addr != 0) {
-                uintptr_t class_private_addr = read_memory<uintptr_t>(actor_addr + OFFSET_CLASS_PRIVATE);
-                uintptr_t name_private_addr = class_private_addr + OFFSET_NAME_PRIVATE;
-                std::string class_name = get_fname_string(name_private_addr);
-
-                if (class_name == "GBCharacter") {
-                    uintptr_t root_component_addr = read_memory<uintptr_t>(actor_addr + OFFSET_ROOT_COMPONENT);
-                    FVector location = read_memory<FVector>(root_component_addr + OFFSET_RELATIVE_LOCATION);
-                    FVector2D screen_location = WorldToScreen(location, camera_cache, g_screen_width, g_screen_height);
-
-                    DrawText(screen_location.X, screen_location.Y, class_name, RGB(255, 255, 255));
+        if (_kbhit()) {
+            char key = _getch();
+            if (key == 'q' || key == 'Q') break;
+            for (auto& pair : cheats) {
+                if (key == ('0' + pair.second.key)) {
+                    pair.second.enabled = !pair.second.enabled;
+                    if (pair.second.enabled) StoreOriginalValue(hProcess, pair.second, sizeof(float));
+                    else RestoreOriginalValue(hProcess, pair.second);
                 }
             }
+            PrintMenu(cheats);
         }
 
-        EndRender();
-        Sleep(1);
+        if (cheats.at("health").enabled) { int val = 1337; ApplyCheatValue(hProcess, cheats.at("health").address, &val, sizeof(val)); }
+        if (cheats.at("stamina").enabled && max_stamina_addr) {
+            float val = 1000.0f;
+            ApplyCheatValue(hProcess, cheats.at("stamina").address, &val, sizeof(val));
+            ApplyCheatValue(hProcess, max_stamina_addr, &val, sizeof(val));
+        }
+        if (cheats.at("ammo").enabled && ammo_cap_addr) {
+            
+                int val = 1000;
+                ApplyCheatValue(hProcess, cheats.at("ammo").address, &val, sizeof(val));
+                ApplyCheatValue(hProcess, ammo_cap_addr, &val, sizeof(val));
+
+            
+        }
+        if (cheats.at("rapid_fire").enabled) { float val = 0.001f; ApplyCheatValue(hProcess, cheats.at("rapid_fire").address, &val, sizeof(val)); }
+        Sleep(100);
     }
 
-    CloseHandle(g_process_handle);
+    std::cout << "\nRestoring original values..." << std::endl;
+    for (const auto& pair : cheats) { RestoreOriginalValue(hProcess, pair.second); }
+    CloseHandle(hProcess);
     return 0;
 }
