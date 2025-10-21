@@ -18,6 +18,17 @@ struct CheatState {
 };
 
 namespace Offsets {
+    const uintptr_t ULocalPlayer_StaticOffset = 0x68FE4A8;
+    const std::vector<uintptr_t> ULocalPlayer_TArray_Chain = { 0x180, 0x38 };
+    const std::vector<uintptr_t> AGBCharacter_FromULocalPlayer_Chain = { 0x258, 0x198, 0x30, 0x5D0 };
+    const std::vector<uintptr_t> MovementComponent_FromAGBCharacter_Chain = { 0x5C0, 0x148, 0x288 };
+
+    const std::vector<uintptr_t> SuperMovement_Offsets = {
+        0xB00, 0xB04, 0xB08, 0xB0C, 0xB10, 0xB14, 0xB18, 0xB1C, 0xB20, 0xB24, 0xB28, 0xB2C, 0xB30, 0xB34, 0xB38, 0xB3C,
+        0xB40, 0xB44, 0xB48, 0xB4C, 0xB50, 0xB54, 0xB58, 0xB5C, 0xB60, 0xB64, 0xB68, 0xB6C, 0xB70, 0xB74, 0xB78, 0xB7C,
+        0xB80, 0xB84, 0xB88, 0xB8C, 0xB90, 0xB94, 0xBA8, 0xBAC, 0xBB0, 0xBB4, 0xBB8
+    };
+
     const std::vector<uintptr_t> PlayerController_BaseChain = { 0x30, 0x5D0 };
     const uintptr_t APawn_Offset = 0x2A0;
 
@@ -65,11 +76,18 @@ uintptr_t GetModuleBaseAddress(DWORD procId, const wchar_t* modName) {
     return modBaseAddr;
 }
 
+uintptr_t ResolvePointer(HANDLE hProc, uintptr_t baseAddress, const std::vector<uintptr_t>& offsets) {
+    uintptr_t addr = baseAddress;
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        if (!ReadProcessMemory(hProc, (LPCVOID)(addr + offsets[i]), &addr, sizeof(uintptr_t), nullptr) || addr == 0) return 0;
+    }
+    return addr;
+}
+
 uintptr_t ResolvePointerChain(HANDLE hProc, uintptr_t baseAddress, const std::vector<uintptr_t>& offsets) {
     uintptr_t addr = baseAddress;
     for (size_t i = 0; i < offsets.size() - 1; ++i) {
-        uintptr_t readAddress = addr + offsets[i];
-        if (!ReadProcessMemory(hProc, (LPCVOID)readAddress, &addr, sizeof(uintptr_t), nullptr) || addr == 0) return 0;
+        if (!ReadProcessMemory(hProc, (LPCVOID)(addr + offsets[i]), &addr, sizeof(uintptr_t), nullptr) || addr == 0) return 0;
     }
     return addr + offsets.back();
 }
@@ -95,10 +113,10 @@ void ApplyCheatValue(HANDLE hProc, uintptr_t address, const void* cheat_value, s
 
 void PrintMenu(const std::map<std::string, CheatState>& cheats) {
     system("cls");
-    std::cout << "--- Ground Branch Definitive Cheat (Restored) ---" << std::endl;
+    std::cout << "--- Ground Branch Definitive Cheat ---" << std::endl;
     for (const auto& pair : cheats) {
         const auto& cheat = pair.second;
-        std::cout << "[" << cheat.key << "] " << cheat.name << ": " << (cheat.enabled ? "ON" : "OFF") << std::endl;
+        std::cout << "[" << cheat.key << "] " << cheat.name << ": " << (cheat.enabled ? "ON" : "OFF") << " (0x" << std::hex << cheat.address << ")" << std::endl;
     }
     std::cout << "\n[Q] to Quit (restores all values)" << std::endl;
 }
@@ -113,7 +131,8 @@ int main() {
         {"health", {"Infinite Health", false, 1}},
         {"stamina", {"Infinite Stamina", false, 2}},
         {"ammo", {"Infinite Ammo (BROKEN)", false, 3}},
-        {"rapid_fire", {"Rapid Fire", false, 4}}
+        {"rapid_fire", {"Rapid Fire", false, 4}},
+        {"super_movement", {"Super Movement", false, 5}}
     };
 
     DWORD procId = GetProcId(processName);
@@ -125,9 +144,10 @@ int main() {
     uintptr_t initial_ptr = 0;
     uintptr_t playerControllerBase = 0;
     uintptr_t pawnBase = 0;
+    uintptr_t movementComponentBase = 0;
 
     std::cout << "Waiting for game..." << std::endl;
-    while (playerControllerBase == 0 || pawnBase == 0) {
+    while (playerControllerBase == 0 || pawnBase == 0 || movementComponentBase == 0) {
         ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + staticPointerOffset), &initial_ptr, sizeof(initial_ptr), nullptr);
         if (initial_ptr) {
             uintptr_t controllerPtrAddr = ResolvePointerChain(hProcess, initial_ptr, Offsets::PlayerController_BaseChain);
@@ -135,6 +155,22 @@ int main() {
 
             uintptr_t pawnPtrAddr = initial_ptr + Offsets::APawn_Offset;
             ReadProcessMemory(hProcess, (LPCVOID)pawnPtrAddr, &pawnBase, sizeof(pawnBase), nullptr);
+
+            uintptr_t uLocalPlayerPtr = 0;
+            ReadProcessMemory(hProcess, (LPCVOID)(moduleBase + Offsets::ULocalPlayer_StaticOffset), &uLocalPlayerPtr, sizeof(uLocalPlayerPtr), nullptr);
+            if (uLocalPlayerPtr) {
+                uintptr_t tArrayDataPtr = ResolvePointer(hProcess, uLocalPlayerPtr, Offsets::ULocalPlayer_TArray_Chain);
+                if (tArrayDataPtr) {
+                    uintptr_t firstElementPtr = 0;
+                    ReadProcessMemory(hProcess, (LPCVOID)tArrayDataPtr, &firstElementPtr, sizeof(firstElementPtr), nullptr);
+                    if (firstElementPtr) {
+                        uintptr_t agbCharacterPtr = ResolvePointer(hProcess, firstElementPtr, Offsets::AGBCharacter_FromULocalPlayer_Chain);
+                        if (agbCharacterPtr) {
+                            movementComponentBase = ResolvePointer(hProcess, agbCharacterPtr, Offsets::MovementComponent_FromAGBCharacter_Chain);
+                        }
+                    }
+                }
+            }
         }
         Sleep(1000);
     }
@@ -158,33 +194,74 @@ int main() {
             for (auto& pair : cheats) {
                 if (key == ('0' + pair.second.key)) {
                     pair.second.enabled = !pair.second.enabled;
-                    if (pair.second.enabled) StoreOriginalValue(hProcess, pair.second, sizeof(float));
-                    else RestoreOriginalValue(hProcess, pair.second);
+                    if (pair.first == "super_movement") {
+                        if (pair.second.enabled) {
+                            pair.second.original_value.clear();
+                            for (const auto& offset : Offsets::SuperMovement_Offsets) {
+                                uintptr_t address = movementComponentBase + offset;
+                                float original_value;
+                                ReadProcessMemory(hProcess, (LPCVOID)address, &original_value, sizeof(original_value), nullptr);
+                                CheatState& cheat_state = pair.second;
+                                cheat_state.original_value.insert(cheat_state.original_value.end(), (BYTE*)&original_value, (BYTE*)&original_value + sizeof(original_value));
+                                float new_value = original_value * 5.0f;
+                                ApplyCheatValue(hProcess, address, &new_value, sizeof(new_value));
+                            }
+                        }
+                        else {
+                            size_t i = 0;
+                            for (const auto& offset : Offsets::SuperMovement_Offsets) {
+                                uintptr_t address = movementComponentBase + offset;
+                                float original_value;
+                                memcpy(&original_value, pair.second.original_value.data() + i, sizeof(original_value));
+                                ApplyCheatValue(hProcess, address, &original_value, sizeof(original_value));
+                                i += sizeof(original_value);
+                            }
+                            pair.second.original_value.clear();
+                        }
+                    }
+                    else {
+                        if (pair.second.enabled) StoreOriginalValue(hProcess, pair.second, sizeof(float));
+                        else RestoreOriginalValue(hProcess, pair.second);
+                    }
                 }
             }
             PrintMenu(cheats);
         }
 
-        if (cheats.at("health").enabled) { int val = 1337; ApplyCheatValue(hProcess, cheats.at("health").address, &val, sizeof(val)); }
+        if (cheats.at("health").enabled) { int val = 10000; ApplyCheatValue(hProcess, cheats.at("health").address, &val, sizeof(val)); }
         if (cheats.at("stamina").enabled && max_stamina_addr) {
             float val = 1000.0f;
             ApplyCheatValue(hProcess, cheats.at("stamina").address, &val, sizeof(val));
             ApplyCheatValue(hProcess, max_stamina_addr, &val, sizeof(val));
         }
         if (cheats.at("ammo").enabled && ammo_cap_addr) {
-            
-                int val = 1000;
-                ApplyCheatValue(hProcess, cheats.at("ammo").address, &val, sizeof(val));
-                ApplyCheatValue(hProcess, ammo_cap_addr, &val, sizeof(val));
 
-            
+            int val = 1000;
+            ApplyCheatValue(hProcess, cheats.at("ammo").address, &val, sizeof(val));
+            ApplyCheatValue(hProcess, ammo_cap_addr, &val, sizeof(val));
+
+
         }
-        if (cheats.at("rapid_fire").enabled) { float val = 0.001f; ApplyCheatValue(hProcess, cheats.at("rapid_fire").address, &val, sizeof(val)); }
+        if (cheats.at("rapid_fire").enabled) { float val = 0.0001f; ApplyCheatValue(hProcess, cheats.at("rapid_fire").address, &val, sizeof(val)); }
         Sleep(100);
     }
 
     std::cout << "\nRestoring original values..." << std::endl;
-    for (const auto& pair : cheats) { RestoreOriginalValue(hProcess, pair.second); }
+    if (cheats.at("super_movement").enabled) {
+        size_t i = 0;
+        for (const auto& offset : Offsets::SuperMovement_Offsets) {
+            uintptr_t address = movementComponentBase + offset;
+            float original_value;
+            memcpy(&original_value, cheats.at("super_movement").original_value.data() + i, sizeof(original_value));
+            ApplyCheatValue(hProcess, address, &original_value, sizeof(original_value));
+            i += sizeof(original_value);
+        }
+    }
+    for (const auto& pair : cheats) {
+        if (pair.first != "super_movement") {
+            RestoreOriginalValue(hProcess, pair.second);
+        }
+    }
     CloseHandle(hProcess);
     return 0;
 }
